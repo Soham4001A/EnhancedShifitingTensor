@@ -16,7 +16,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
-#include <future> // For std::async to achieve true overlap
+#include <thread>
+#include <future>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 
 // --- Platform-specific includes & helpers ---
 #if defined(__x86_64__) || defined(_M_X64)
@@ -33,12 +37,12 @@
   #define TARGET_AVX2_FMA
 #endif
 
-// --- Base hyper-parameters ---
-static constexpr int B_base = 256;
-static constexpr int I_base = 4096;
-static constexpr int O_base = 4096;
-static constexpr int Nwarmup = 2; // Reduced for faster testing at scale
-static constexpr int Nbench  = 10; // Reduced for faster testing at scale
+// --- Base hyper-parameters (Realistic for a ~7B parameter model's FFN layer) ---
+static constexpr int B_base = 32;
+static constexpr int I_base = 4096;   // Represents d_model
+static constexpr int O_base = 16384;  // Represents d_ffn (4 * d_model)
+static constexpr int Nwarmup = 2;
+static constexpr int Nbench  = 10;
 
 // --- Helper: aligned malloc/free ---
 void* aligned_malloc(size_t bytes, size_t align = 64) {
@@ -120,65 +124,134 @@ void forward_packed(const float* A, const PackedWeights& P, float* Y, int b_dim,
 }
 #endif
 
+
 // ===================================================================================
-//  V2 INNOVATION: ENHANCED PIPELINE WITH TRUE OVERLAP AND AMORTIZED SHIFTING
+//  V3 INNOVATION: PERSISTENT THREAD, VECTORIZED SHIFT, AND PREFETCHING
 // ===================================================================================
 #if defined(__x86_64__) || defined(_M_X64)
+
+// State for communication between main thread and persistent helper thread
+struct WorkerState {
+    const float* W_ptr = nullptr;
+    float* target_buf = nullptr;
+    int o_base = 0, i_base = 0, i_dim = 0;
+
+    std::mutex mtx;
+    std::condition_variable main_cv, worker_cv;
+    std::atomic<bool> work_ready{false};
+    std::atomic<bool> work_done{true};
+    std::atomic<bool> terminate{false};
+};
+
+TARGET_AVX2_FMA
+static void shift_panel_vectorized(const float* w_src, float* w_dst, int i_dim) {
+    constexpr int O_TILE = 8;
+    constexpr int I_BLOCK = 256;
+    for (int i_off = 0; i_off < I_BLOCK; ++i_off) {
+        // This is a gather operation: load 8 floats from scattered locations.
+        // It manually transposes the data as it loads.
+        __m256 row = _mm256_set_ps(
+            w_src[7 * i_dim + i_off], w_src[6 * i_dim + i_off],
+            w_src[5 * i_dim + i_off], w_src[4 * i_dim + i_off],
+            w_src[3 * i_dim + i_off], w_src[2 * i_dim + i_off],
+            w_src[1 * i_dim + i_off], w_src[0 * i_dim + i_off]
+        );
+        // Store them into a contiguous block in the destination buffer.
+        _mm256_store_ps(w_dst + i_off * O_TILE, row);
+    }
+}
+
+// The function the persistent helper thread will run
+void shift_worker(WorkerState& state) {
+    while (true) {
+        std::unique_lock<std::mutex> lock(state.mtx);
+        state.worker_cv.wait(lock, [&]{ return state.work_ready.load() || state.terminate.load(); });
+
+        if (state.terminate.load()) return;
+        
+        shift_panel_vectorized(state.W_ptr + (size_t)state.o_base * state.i_dim + state.i_base, state.target_buf, state.i_dim);
+
+        state.work_done = true;
+        state.work_ready = false;
+        lock.unlock();
+        state.main_cv.notify_one();
+    }
+}
+
 TARGET_AVX2_FMA
 __attribute__((noinline))
-void forward_pipelined_enhanced(const float* A, const float* W, float* Y, int b_dim, int i_dim, int o_dim) {
+void forward_pipelined_v3(const float* A, const float* W, float* Y, int b_dim, int i_dim, int o_dim) {
     constexpr int O_TILE = 8;
     constexpr int I_BLOCK = 256;
     alignas(64) float w_buf_A[I_BLOCK * O_TILE], w_buf_B[I_BLOCK * O_TILE];
-    float* w_shift_buf = w_buf_A, *w_compute_buf = w_buf_B; // Start with swapped roles
-
-    auto shift_panel = [&](float* target_buf, int o, int i) {
-        for (int i_off = 0; i_off < I_BLOCK; ++i_off) {
-            for (int o_off = 0; o_off < O_TILE; ++o_off) {
-                target_buf[i_off * O_TILE + o_off] = W[(size_t)(o + o_off) * i_dim + (i + i_off)];
-            }
-        }
-    };
     
-    // New loop order: o -> b -> i. This amortizes the shifting cost.
-    for (int o_base = 0; o_base < o_dim; o_base += O_TILE) {
-        for(int b=0; b<b_dim; ++b) {
-            std::memset(Y + (size_t)b*o_dim + o_base, 0, O_TILE * sizeof(float));
-        }
+    WorkerState state;
+    state.i_dim = i_dim;
+    std::thread worker(shift_worker, std::ref(state));
 
-        // Prime the pipeline: synchronously shift the first block
-        shift_panel(w_compute_buf, o_base, 0);
+    for (int o_base = 0; o_base < o_dim; o_base += O_TILE) {
+        for(int b=0; b<b_dim; ++b) std::memset(Y + (size_t)b*o_dim + o_base, 0, O_TILE * sizeof(float));
+
+        float* w_compute_buf = w_buf_A;
+        float* w_shift_buf = w_buf_B;
+        
+        // Prime the pipeline: Synchronously shift the first block
+        shift_panel_vectorized(W + (size_t)o_base * i_dim, w_compute_buf, i_dim);
 
         for (int i_base = 0; i_base < i_dim; i_base += I_BLOCK) {
-            std::future<void> shift_future;
-            // STEP 1: LAUNCH ASYNC SHIFT FOR NEXT BLOCK
+            // STEP 1: LAUNCH SHIFT FOR NEXT BLOCK (N+1) using the persistent thread
             if (i_base + I_BLOCK < i_dim) {
-                shift_future = std::async(std::launch::async, shift_panel, w_shift_buf, o_base, i_base + I_BLOCK);
+                // Prefetch data for block N+2 to hide L2/L3 latency
+                _mm_prefetch(W + (size_t)o_base * i_dim + i_base + 2*I_BLOCK, _MM_HINT_T0);
+
+                std::unique_lock<std::mutex> lock(state.mtx);
+                state.target_buf = w_shift_buf;
+                state.W_ptr = W; // Pass base pointer
+                state.o_base = o_base;
+                state.i_base = i_base + I_BLOCK;
+                state.work_done = false;
+                state.work_ready = true;
+                lock.unlock();
+                state.worker_cv.notify_one();
             }
 
-            // STEP 2: COMPUTE ON CURRENT BLOCK (for the whole batch)
+            // STEP 2: COMPUTE ON CURRENT BLOCK (N)
             for (int b = 0; b < b_dim; ++b) {
                 const float* a_ptr = A + (size_t)b * i_dim + i_base;
                 float* y_ptr = Y + (size_t)b * o_dim + o_base;
-                __m256 vsum = _mm256_load_ps(y_ptr); // Load previous sum
+                __m256 vsum = _mm256_load_ps(y_ptr);
                 for (int i_off = 0; i_off < I_BLOCK; ++i_off) {
-                    __m256 va_splat = _mm256_set1_ps(*(a_ptr + i_off));
-                    __m256 vw_packed = _mm256_load_ps(w_compute_buf + i_off * O_TILE);
-                    vsum = _mm256_fmadd_ps(va_splat, vw_packed, vsum);
+                    vsum = _mm256_fmadd_ps(_mm256_set1_ps(*(a_ptr + i_off)), _mm256_load_ps(w_compute_buf + i_off * O_TILE), vsum);
                 }
-                _mm256_store_ps(y_ptr, vsum); // Store updated sum
+                _mm256_store_ps(y_ptr, vsum);
             }
             
-            // STEP 3: SYNCHRONIZE and SWAP
-            if (shift_future.valid()) {
-                shift_future.get();
+            // STEP 3: SYNCHRONIZE with helper thread and SWAP buffers
+            if (i_base + I_BLOCK < i_dim) {
+                std::unique_lock<std::mutex> lock(state.mtx);
+                state.main_cv.wait(lock, [&]{ return state.work_done.load(); });
             }
             std::swap(w_compute_buf, w_shift_buf);
         }
     }
+    
+    // Cleanly terminate the worker thread
+    {
+        std::unique_lock<std::mutex> lock(state.mtx);
+        state.terminate = true;
+        state.work_ready = true; // Wake up the worker one last time
+        lock.unlock();
+        state.worker_cv.notify_one();
+    }
+    worker.join();
 }
 #elif defined(__aarch64__)
-// The ARM version would follow the same std::async logic
+// An ARM NEON v3 implementation would go here, following the same logic
+// with pthreads/std::thread and NEON intrinsics for the shift.
+void forward_pipelined_v3(const float* A, const float* W, float* Y, int b_dim, int i_dim, int o_dim) {
+    // Placeholder for ARM
+    printf("V3 Pipelined not implemented for ARM yet.\n");
+}
 #endif
 
 // Main function to run the benchmark
@@ -212,9 +285,9 @@ int main() {
 
         double pipelined_ms = 0;
         {
-            printf("Benchmarking 'Enhanced Pipelined' Approach...\n");
+            printf("Benchmarking 'Enhanced Pipelined (V3)' Approach...\n");
             auto t1 = std::chrono::steady_clock::now();
-            for (int k = 0; k < Nbench; ++k) forward_pipelined_enhanced(A, W, Y, B, I, O);
+            for (int k = 0; k < Nbench; ++k) forward_pipelined_v3(A, W, Y, B, I, O);
             auto t2 = std::chrono::steady_clock::now();
             pipelined_ms = std::chrono::duration<double, std::milli>(t2-t1).count();
         }
@@ -224,8 +297,8 @@ int main() {
         double gflops_packed = flops / (packed_ms / Nbench * 1e6);
         double gflops_pipelined = flops / (pipelined_ms / Nbench * 1e6);
         printf("Packed (Library Style)       : %.2f GFLOP/s\n", gflops_packed);
-        printf("Enhanced Pipelined (V2 Idea) : %.2f GFLOP/s\n", gflops_pipelined);
-        printf("\nSpeed-up of V2 Pipelined vs Packed: %.2fx\n", gflops_pipelined / gflops_packed);
+        printf("Enhanced Pipelined (V3 Idea) : %.2f GFLOP/s\n", gflops_pipelined);
+        printf("\nSpeed-up of V3 Pipelined vs Packed: %.2fx\n", gflops_pipelined / gflops_packed);
 
         aligned_free(A);
         aligned_free(W);
