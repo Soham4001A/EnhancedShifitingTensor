@@ -1,7 +1,3 @@
-Of course. Here is a comprehensive `README.md` file for your project. It's crafted to be accessible to a non-technical audience while providing the in-depth technical details that developers and researchers would need. It frames your innovative work, explains its significance, and provides clear instructions and results.
-
----
-
 # Shifting Tensor: A Dynamic Pipelined Approach to Matrix Multiplication
 
 This repository contains a high-performance C++ implementation of a novel matrix multiplication (GEMM) kernel. It's designed to explore an alternative to the traditional "pre-packing" method used in standard libraries like OpenBLAS and MKL.
@@ -83,13 +79,6 @@ Speed-up of V3 Pipelined vs Packed: 0.97x
 The results show that the `Pipelined V3` approach is **highly competitive** with the gold-standard `Packed` method, often achieving >95% of its performance. This is a significant achievement because our method completely avoids the large memory footprint and upfront computational cost of pre-packing the entire weight matrix.
 
 This validates the core hypothesis: for single-pass inference or dynamic-weight scenarios, an on-the-fly pipelined approach can be a highly effective alternative to static pre-packing.
-
-## Architectural Evolution
-
-This project was built iteratively based on performance analysis and feedback.
-*   **V1:** A simple sequential pipeline that re-shifted data for every batch item. It was slow due to massive redundant work.
-*   **V2:** Used `std::async` to introduce true concurrency and amortized the shifting cost by changing the loop order. It was much faster but suffered from high thread-creation overhead.
-*   **V3 (Current):** Implemented a persistent helper thread to eliminate thread overhead and vectorized the shifting logic, bringing performance nearly on par with the pre-packed standard.
 
 ## Future Work & Improvements
 
