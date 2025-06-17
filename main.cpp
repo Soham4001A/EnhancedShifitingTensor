@@ -1,262 +1,258 @@
-// clang++ -O3 -std=c++20 -march=armv8.4-a+simd -o shift main.cpp
-// ./shift
+// =================================================================================
+// Universal Compilation Instructions (GCC/Clang/MSVC)
+// =================================================================================
+// Linux (GCC) / macOS (Clang):
+//   g++ -O3 -std=c++20 -march=native -o shift main.cpp
+//
+// Windows (MSVC):
+//   cl.exe /O2 /EHsc /std:c++20 /arch:AVX2 /Fe:shift.exe main.cpp
+// =================================================================================
 
 #include <algorithm>
-#include <array>
-#include <cassert>
-#include <chrono>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <vector>
+#include <chrono>
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <random>
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__AVX2__)
-  #include <immintrin.h>   // AVX2 / AVX‑512 intrinsics
+// --- Platform-specific includes & helpers ---
+#if defined(__x86_64__) || defined(_M_X64)
+  #include <immintrin.h>
 #elif defined(__aarch64__)
-  #include <arm_neon.h>    // NEON intrinsics on Apple Silicon
+  #include <arm_neon.h>
+#endif
+#if defined(_WIN32)
+  #include <malloc.h>
+#endif
+#if defined(__GNUC__) || defined(__clang__)
+  #define TARGET_AVX2_FMA __attribute__((target("avx2,fma")))
+#else
+  #define TARGET_AVX2_FMA
 #endif
 
-// --- Base hyper-parameters (will be scaled in main) ----------------------
+// --- Base hyper-parameters ---
 static constexpr int B_base = 256;
 static constexpr int I_base = 4096;
 static constexpr int O_base = 4096;
-static constexpr int Nhots_max   = 256;
-static constexpr int Hot_threshold = 8;
-static constexpr int Nwarmup = 5;  // Reduced for faster testing at scale
-static constexpr int Nbench  = 20; // Reduced for faster testing at scale
+static constexpr int Nwarmup = 5;
+static constexpr int Nbench  = 20;
 
-// Forward declarations
-inline float dot_vec(const float* a, const float* w, int i_dim);
-
-// --- helper: aligned malloc --------------------------------------------------
+// --- Helper: aligned malloc/free ---
 void* aligned_malloc(size_t bytes, size_t align = 64) {
-    void* p; if(posix_memalign(&p, align, bytes)) return nullptr; return p;
+#if defined(_WIN32)
+    return _aligned_malloc(bytes, align);
+#else
+    void* p; if (posix_memalign(&p, align, bytes) != 0) return nullptr; return p;
+#endif
+}
+void aligned_free(void* p) {
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
+    free(p);
+#endif
 }
 
-// --- baseline forward pass ---------------------------------------------------
-__attribute__((noinline))
-void forward_baseline(const float* A, const float* W, float* Y, int b_dim, int i_dim, int o_dim) {
-    for(int b=0;b<b_dim;++b){
-        const float* a = A + b*i_dim;
-        float* y = Y + b*o_dim;
-        for (int o = 0; o < o_dim; ++o) {
-            const float* wcol = W + size_t(o) * i_dim;
-            float sum = dot_vec(a, wcol, i_dim);
-            y[o] = sum;
+// ===================================================================================
+//  BASELINE LIBRARY APPROACH: PRE-PACKED WEIGHTS
+// ===================================================================================
+struct PackedWeights {
+    float* W_packed;
+    PackedWeights(const float* W, int i_dim, int o_dim) {
+#if defined(__x86_64__) || defined(_M_X64)
+        constexpr int O_TILE = 8;
+#elif defined(__aarch64__)
+        constexpr int O_TILE = 4;
+#endif
+        W_packed = static_cast<float*>(aligned_malloc(size_t(i_dim) * o_dim * sizeof(float)));
+        for (int o_base = 0; o_base < o_dim; o_base += O_TILE) {
+            for (int i = 0; i < i_dim; ++i) {
+                for (int o_off = 0; o_off < O_TILE; ++o_off) {
+                    const float* src = W + size_t(o_base + o_off) * i_dim + i;
+                    float* dst = W_packed + size_t(o_base/O_TILE)*i_dim*O_TILE + size_t(i)*O_TILE + o_off;
+                    *dst = *src;
+                }
+            }
         }
     }
-}
-
-// --- shifted forward pass ----------------------------------------------------
-struct HotBuf {
-    float* slab;
-    int    size;
-    std::vector<int> map;
-    std::vector<int> acc;
-
-    HotBuf(int o_dim, int i_dim) : map(o_dim, -1), acc(o_dim, 0) {
-        slab = static_cast<float*>(aligned_malloc(size_t(Nhots_max)*i_dim*sizeof(float)));
-        size = 0;
-    }
-    ~HotBuf(){ free(slab); }
+    ~PackedWeights() { aligned_free(W_packed); }
 };
 
-inline void maybe_cache(int o, const float* W, HotBuf& H, int i_dim){
-    if (H.map[o] != -1) return;
-    if (++H.acc[o] < Hot_threshold) return;
-    if (H.size >= Nhots_max) return;
-
-    float* dst = H.slab + size_t(H.size)*i_dim;
-    memcpy(dst, W + size_t(o)*i_dim, i_dim*sizeof(float));
-    H.map[o] = H.size++;
-}
-
+#if defined(__x86_64__) || defined(_M_X64)
+TARGET_AVX2_FMA
 __attribute__((noinline))
-void forward_shifted(const float* A, const float* W, float* Y, HotBuf& H, int b_dim, int i_dim, int o_dim){
-    for(int b=0;b<b_dim;++b){
-        const float* a = A + b*i_dim;
-        float* y = Y + b*o_dim;
-        for(int o=0;o<o_dim;++o){
-            const int hot_idx = H.map[o];
-            const float* wcol = (hot_idx == -1)
-                                ? (W + size_t(o)*i_dim)
-                                : (H.slab + size_t(hot_idx)*i_dim);
-
-            float sum = dot_vec(a, wcol, i_dim);
-            y[o] = sum;
-
-            maybe_cache(o, W, H, i_dim);
-        }
-    }
-}
-
-// --- Tiled forward pass (for data reuse) -------------------------------------
-#if defined(__aarch64__)
-__attribute__((noinline))
-void forward_tiled(const float* A, const float* W, float* Y, int b_dim, int i_dim, int o_dim){
-    constexpr int O_TILE = 4;
-    assert(o_dim % O_TILE == 0 && "Output dimension must be a multiple of tile size for this simple implementation");
-
-    for(int b = 0; b < b_dim; ++b){
-        const float* a = A + b*i_dim;
-        float* y = Y + b*o_dim;
-        for(int o_base = 0; o_base < o_dim; o_base += O_TILE){
-            float32x4_t vsum0=vdupq_n_f32(0.f), vsum1=vdupq_n_f32(0.f), vsum2=vdupq_n_f32(0.f), vsum3=vdupq_n_f32(0.f);
-
-            const float* wcol0 = W + size_t(o_base + 0) * i_dim;
-            const float* wcol1 = W + size_t(o_base + 1) * i_dim;
-            const float* wcol2 = W + size_t(o_base + 2) * i_dim;
-            const float* wcol3 = W + size_t(o_base + 3) * i_dim;
-
-            for (int i = 0; i < i_dim; i += 4) {
-                float32x4_t va = vld1q_f32(a + i);
-                float32x4_t vw0 = vld1q_f32(wcol0 + i);
-                float32x4_t vw1 = vld1q_f32(wcol1 + i);
-                float32x4_t vw2 = vld1q_f32(wcol2 + i);
-                float32x4_t vw3 = vld1q_f32(wcol3 + i);
-
-                vsum0 = vfmaq_f32(vsum0, va, vw0);
-                vsum1 = vfmaq_f32(vsum1, va, vw1);
-                vsum2 = vfmaq_f32(vsum2, va, vw2);
-                vsum3 = vfmaq_f32(vsum3, va, vw3);
+void forward_packed(const float* A, const PackedWeights& P, float* Y, int b_dim, int i_dim, int o_dim) {
+    constexpr int O_TILE = 8;
+    for (int b = 0; b < b_dim; ++b) {
+        for (int o_base = 0; o_base < o_dim; o_base += O_TILE) {
+            __m256 vsum = _mm256_setzero_ps();
+            const float* a_ptr = A + b * i_dim;
+            const float* w_pack_ptr = P.W_packed + size_t(o_base/O_TILE)*i_dim*O_TILE;
+            for (int i = 0; i < i_dim; ++i) {
+                __m256 va_splat = _mm256_set1_ps(*(a_ptr + i));
+                __m256 vw_packed = _mm256_load_ps(w_pack_ptr + size_t(i)*O_TILE);
+                vsum = _mm256_fmadd_ps(va_splat, vw_packed, vsum);
             }
-            y[o_base + 0] = vaddvq_f32(vsum0);
-            y[o_base + 1] = vaddvq_f32(vsum1);
-            y[o_base + 2] = vaddvq_f32(vsum2);
-            y[o_base + 3] = vaddvq_f32(vsum3);
+            _mm256_store_ps(Y + b*o_dim + o_base, vsum);
         }
     }
-}
-#endif
-// NOTE: An equivalent x86 AVX implementation would be similar but tile by 8.
-
-// -----------------------------------------------------------------------------
-//  Architecture‑specific dot product
-// -----------------------------------------------------------------------------
-#if defined(__x86_64__) || defined(_M_X64) || defined(__AVX2__)
-inline float dot_vec(const float* a, const float* w, int i_dim) {
-    __m256 vsum = _mm256_setzero_ps();
-    for (int i = 0; i < i_dim; i += 8) {
-        __m256 va = _mm256_loadu_ps(a + i);
-        __m256 vw = _mm256_loadu_ps(w + i);
-        vsum = _mm256_fmadd_ps(va, vw, vsum);
-    }
-    float tmp[8];
-    _mm256_storeu_ps(tmp, vsum);
-    return tmp[0]+tmp[1]+tmp[2]+tmp[3]+tmp[4]+tmp[5]+tmp[6]+tmp[7];
 }
 #elif defined(__aarch64__)
-inline float dot_vec(const float* a, const float* w, int i_dim) {
-    float32x4_t vsum = vdupq_n_f32(0.f);
-    for (int i = 0; i < i_dim; i += 4) {
-        float32x4_t va = vld1q_f32(a + i);
-        float32x4_t vw = vld1q_f32(w + i);
-        vsum = vfmaq_f32(vsum, va, vw);
+__attribute__((noinline))
+void forward_packed(const float* A, const PackedWeights& P, float* Y, int b_dim, int i_dim, int o_dim) {
+    constexpr int O_TILE = 4;
+    for (int b = 0; b < b_dim; ++b) {
+        for (int o_base = 0; o_base < o_dim; o_base += O_TILE) {
+            float32x4_t vsum = vdupq_n_f32(0.f);
+            const float* a_ptr = A + b * i_dim;
+            const float* w_pack_ptr = P.W_packed + size_t(o_base/O_TILE)*i_dim*O_TILE;
+            for (int i = 0; i < i_dim; ++i) {
+                float32x4_t va_splat = vld1q_dup_f32(a_ptr + i);
+                float32x4_t vw_packed = vld1q_f32(w_pack_ptr + size_t(i)*O_TILE);
+                vsum = vfmaq_f32(vsum, va_splat, vw_packed);
+            }
+            vst1q_f32(Y + b*o_dim + o_base, vsum);
+        }
     }
-    return vaddvq_f32(vsum);
-}
-#else
-inline float dot_vec(const float* a, const float* w, int i_dim) {
-    float sum = 0.f;
-    for (int i = 0; i < i_dim; ++i) sum += a[i] * w[i];
-    return sum;
 }
 #endif
 
-// -----------------------------------------------------------------------------
-//                     micro-driver / benchmark
-// -----------------------------------------------------------------------------
-enum class ForwardType { BASELINE, SHIFTED, TILED };
+// ===================================================================================
+//  YOUR INNOVATION: ON-THE-FLY PIPELINED "SHIFTING"
+// ===================================================================================
+#if defined(__x86_64__) || defined(_M_X64)
+TARGET_AVX2_FMA
+__attribute__((noinline))
+void forward_pipelined(const float* A, const float* W, float* Y, int b_dim, int i_dim, int o_dim) {
+    constexpr int O_TILE = 8;
+    constexpr int I_BLOCK = 256;
+    alignas(64) float w_buf_A[I_BLOCK * O_TILE], w_buf_B[I_BLOCK * O_TILE];
+    float* w_compute_buf = w_buf_A, *w_shift_buf = w_buf_B;
 
-const char* to_string(ForwardType type) {
-    switch (type) {
-        case ForwardType::BASELINE: return "Baseline";
-        case ForwardType::SHIFTED:  return "Shifted ";
-        case ForwardType::TILED:    return "Tiled   ";
-        default: return "Unknown";
-    }
-}
+    auto shift_block = [&](const float* w_src, float* w_dst, int i_len) {
+        for (int i = 0; i < i_len; ++i) {
+            for(int o=0; o < O_TILE; ++o) w_dst[i * O_TILE + o] = w_src[o * i_dim + i];
+        }
+    };
 
-double run_and_time(ForwardType type, int b_dim, int i_dim, int o_dim) {
-    size_t A_size = size_t(b_dim) * i_dim;
-    size_t W_size = size_t(i_dim) * o_dim;
-    size_t Y_size = size_t(b_dim) * o_dim;
-    
-    std::vector<float> A(A_size), W(W_size), Y(Y_size, 0.0f);
-    volatile float checksum = 0.f;
-    std::mt19937 rng(42); std::uniform_real_distribution<float> d(-1,1);
-    std::generate(A.begin(), A.end(), [&]{ return d(rng); });
-    std::generate(W.begin(), W.end(), [&]{ return d(rng); });
-
-    HotBuf H(o_dim, i_dim);
-    auto t0 = std::chrono::steady_clock::now();
-
-    for(int k=0; k<Nwarmup; ++k) {
-        switch(type) {
-            case ForwardType::BASELINE: forward_baseline(A.data(), W.data(), Y.data(), b_dim, i_dim, o_dim); break;
-            case ForwardType::SHIFTED:  forward_shifted(A.data(), W.data(), Y.data(), H, b_dim, i_dim, o_dim); break;
-            #if defined(__aarch64__)
-            case ForwardType::TILED:    forward_tiled(A.data(), W.data(), Y.data(), b_dim, i_dim, o_dim); break;
-            #endif
+    for (int b = 0; b < b_dim; ++b) {
+        for (int o_base = 0; o_base < o_dim; o_base += O_TILE) {
+            __m256 vsum = _mm256_setzero_ps();
+            const float* a_ptr = A + b * i_dim;
+            const float* w_base_ptr = W + o_base * i_dim;
+            
+            shift_block(w_base_ptr, w_compute_buf, I_BLOCK);
+            
+            for (int i_base = 0; i_base < i_dim; i_base += I_BLOCK) {
+                if (i_base + I_BLOCK < i_dim) {
+                    shift_block(w_base_ptr + i_base + I_BLOCK, w_shift_buf, I_BLOCK);
+                }
+                for (int i_off = 0; i_off < I_BLOCK; ++i_off) {
+                    __m256 va_splat = _mm256_set1_ps(*(a_ptr + i_base + i_off));
+                    __m256 vw_packed = _mm256_load_ps(w_compute_buf + i_off * O_TILE);
+                    vsum = _mm256_fmadd_ps(va_splat, vw_packed, vsum);
+                }
+                std::swap(w_compute_buf, w_shift_buf);
+            }
+            _mm256_store_ps(Y + b*o_dim + o_base, vsum);
         }
     }
+}
+#elif defined(__aarch64__)
+__attribute__((noinline))
+void forward_pipelined(const float* A, const float* W, float* Y, int b_dim, int i_dim, int o_dim) {
+    constexpr int O_TILE = 4;
+    constexpr int I_BLOCK = 256;
+    alignas(64) float w_buf_A[I_BLOCK * O_TILE], w_buf_B[I_BLOCK * O_TILE];
+    float* w_compute_buf = w_buf_A, *w_shift_buf = w_buf_B;
 
-    auto t1 = std::chrono::steady_clock::now();
-    for(int k=0; k<Nbench; ++k) {
-        switch(type) {
-            case ForwardType::BASELINE: forward_baseline(A.data(), W.data(), Y.data(), b_dim, i_dim, o_dim); break;
-            case ForwardType::SHIFTED:  forward_shifted(A.data(), W.data(), Y.data(), H, b_dim, i_dim, o_dim); break;
-            #if defined(__aarch64__)
-            case ForwardType::TILED:    forward_tiled(A.data(), W.data(), Y.data(), b_dim, i_dim, o_dim); break;
-            #endif
+    auto shift_block = [&](const float* w_src, float* w_dst, int i_len) {
+        for (int i = 0; i < i_len; ++i) {
+            for(int o=0; o < O_TILE; ++o) w_dst[i * O_TILE + o] = w_src[o * i_dim + i];
+        }
+    };
+
+    for (int b = 0; b < b_dim; ++b) {
+        for (int o_base = 0; o_base < o_dim; o_base += O_TILE) {
+            float32x4_t vsum = vdupq_n_f32(0.f);
+            const float* a_ptr = A + b * i_dim;
+            const float* w_base_ptr = W + o_base * i_dim;
+            
+            shift_block(w_base_ptr, w_compute_buf, I_BLOCK);
+            
+            for (int i_base = 0; i_base < i_dim; i_base += I_BLOCK) {
+                if (i_base + I_BLOCK < i_dim) {
+                    shift_block(w_base_ptr + i_base + I_BLOCK, w_shift_buf, I_BLOCK);
+                }
+                for (int i_off = 0; i_off < I_BLOCK; ++i_off) {
+                    float32x4_t va_splat = vld1q_dup_f32(a_ptr + i_base + i_off);
+                    float32x4_t vw_packed = vld1q_f32(w_compute_buf + i_off * O_TILE);
+                    vsum = vfmaq_f32(vsum, va_splat, vw_packed);
+                }
+                std::swap(w_compute_buf, w_shift_buf);
+            }
+            vst1q_f32(Y + b*o_dim + o_base, vsum);
         }
     }
-    checksum = checksum + Y[Y_size / 2];
-
-    auto t2 = std::chrono::steady_clock::now();
-    double warm_ms = std::chrono::duration<double, std::milli>(t1-t0).count();
-    double run_ms  = std::chrono::duration<double, std::milli>(t2-t1).count();
-    printf("%s: warm-up %.2f ms, bench %.2f ms", to_string(type), warm_ms, run_ms);
-    (void)checksum;
-    return run_ms;
 }
+#endif
 
-int main(){
+// Main function to run the benchmark
+int main() {
+    printf("--- Running Matrix Multiplication Benchmark ---\n");
+    printf("--- Scale: B=%d, I=%d, O=%d ---\n", B_base, I_base, O_base);
+    const int B = B_base, I = I_base, O = O_base;
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__)
-    for (int scale : {1, 3, 5}) {
-        printf("\n--- Running at Scale: %dx (B=%d, I=%d, O=%d) ---\n",
-               scale, B_base * scale, I_base * scale, O_base * scale);
+    auto A = static_cast<float*>(aligned_malloc(size_t(B)*I*sizeof(float)));
+    auto W = static_cast<float*>(aligned_malloc(size_t(I)*O*sizeof(float)));
+    auto Y = static_cast<float*>(aligned_malloc(size_t(B)*O*sizeof(float)));
+    
+    std::mt19937 rng(42); std::uniform_real_distribution<float> d(-1,1);
+    for(size_t i=0; i<size_t(B)*I; ++i) A[i] = d(rng);
+    for(size_t i=0; i<size_t(I)*O; ++i) W[i] = d(rng);
 
-        const int B = B_base * scale;
-        const int I = I_base * scale;
-        const int O = O_base * scale;
-
-        double t_base  = run_and_time(ForwardType::BASELINE, B, I, O);
-        double t_shift = run_and_time(ForwardType::SHIFTED, B, I, O);
-        #if defined(__aarch64__)
-        double t_tiled = run_and_time(ForwardType::TILED, B, I, O);
-        #endif
-
-        const double flops_per_matmul = double(B) * I * O * 2;
-        double ns_base  = (t_base  * 1e6) / Nbench;
-        double ns_shift = (t_shift * 1e6) / Nbench;
-        
-        double gflops_base  = flops_per_matmul * 1e-9 / (ns_base  * 1e-9);
-        double gflops_shift = flops_per_matmul * 1e-9 / (ns_shift * 1e-9);
-
-        printf("\n\n=== Results (Scale %dx) ===\n", scale);
-        printf("Baseline: %.2f ns/op  (%.1f GFLOP/s)\n", ns_base,  gflops_base);
-        printf("Shifted : %.2f ns/op  (%.1f GFLOP/s) | Speed-up vs Baseline: %.2fx\n", ns_shift, gflops_shift, ns_base / ns_shift);
-
-        #if defined(__aarch64__)
-        double ns_tiled = (t_tiled * 1e6) / Nbench;
-        double gflops_tiled = flops_per_matmul * 1e-9 / (ns_tiled * 1e-9);
-        printf("Tiled   : %.2f ns/op  (%.1f GFLOP/s) | Speed-up vs Baseline: %.2fx\n", ns_tiled, gflops_tiled, ns_base / ns_tiled);
-        #endif
+    // --- Time the Packed (Library) Approach ---
+    double packed_ms = 0;
+    {
+        printf("\nBenchmarking 'Packed' (Library-style) Approach...\n");
+        PackedWeights P(W, I, O); // One-time packing cost is outside the timer
+        auto t1 = std::chrono::steady_clock::now();
+        for (int k = 0; k < Nbench; ++k) {
+            forward_packed(A, P, Y, B, I, O);
+        }
+        auto t2 = std::chrono::steady_clock::now();
+        packed_ms = std::chrono::duration<double, std::milli>(t2-t1).count();
     }
+
+    // --- Time Your Pipelined Approach ---
+    double pipelined_ms = 0;
+    {
+        printf("Benchmarking 'Pipelined' (Your Innovation) Approach...\n");
+        auto t1 = std::chrono::steady_clock::now();
+        for (int k = 0; k < Nbench; ++k) {
+            forward_pipelined(A, W, Y, B, I, O);
+        }
+        auto t2 = std::chrono::steady_clock::now();
+        pipelined_ms = std::chrono::duration<double, std::milli>(t2-t1).count();
+    }
+
+    // --- Report Results ---
+    printf("\n--- Results ---\n");
+    const double flops = double(B) * I * O * 2;
+    double gflops_packed = flops / (packed_ms / Nbench * 1e6);
+    double gflops_pipelined = flops / (pipelined_ms / Nbench * 1e6);
+    printf("Packed (Library Style) : %.2f GFLOP/s\n", gflops_packed);
+    printf("Pipelined (Your Idea)  : %.2f GFLOP/s\n", gflops_pipelined);
+    printf("\nSpeed-up of Pipelined vs Packed: %.2fx\n", gflops_pipelined / gflops_packed);
+
+    aligned_free(A);
+    aligned_free(W);
+    aligned_free(Y);
 #else
-    puts("Compile with AVX2 or run on ARM-NEON.");
+    puts("This benchmark requires NEON or AVX support.");
 #endif
     return 0;
 }
